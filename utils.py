@@ -1,28 +1,9 @@
-"""
-This is the utils module. It contains utility functions for mathematical operations, file handling, and other miscellaneous tasks.
-"""
+"""Small general-purpose helpers kept from the original API."""
 
 import os
 import random
-import string
 import shutil
-import time
-from .nodeIntersection import (
-    do_meshes_intersect,
-    compute_intersection_points,
-    panda_mesh_to_numpy,
-    Mgr as NodeIntersection,
-    Sphere,
-    Cube,
-    BaseActor,
-    BaseCollider,
-    ComplexActor,
-    ComplexCollider,
-    CollisionReport,
-    CubeGenerator,
-)
-
-# import opensimplex
+import string
 
 
 class Misc:
@@ -130,22 +111,3 @@ class File:
     def get_file_access_time(file_path):
         """Returns the access time of a file."""
         return os.path.getatime(file_path)
-
-
-class Noise:
-    # Requires opensimplex
-
-    # def generate_noise(x, y, seed=None):
-    #     """Generates noise using the OpenSimplex algorithm."""
-    #     if seed is None:
-    #         seed = int(time.time() * 1000) % 1000
-    #     opensimplex.seed(seed)
-    #     return opensimplex.noise2(x, y)
-
-    # def generate_noise_array(x, y, seed=None):
-    #     """Generates noise using the OpenSimplex algorithm."""
-    #     if seed is None:
-    #         seed = int(time.time() * 1000) % 1000
-    #     opensimplex.seed(seed)
-    #     return opensimplex.noise2array(x, y)
-    None

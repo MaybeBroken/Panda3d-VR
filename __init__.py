@@ -1,39 +1,61 @@
-from .core import BaseVrApp, main as VrApi, xr, WANT_VR_INIT
-from .utils import (
-    Math,
-    File,
-    Misc,
-    Noise,
-    NodeIntersection,
-    Sphere,
-    Cube,
+"""
+Panda3D-VR: OpenXR for Panda3D.
+
+    from panda3d_vr import BaseVrApp
+
+    class App(BaseVrApp):
+        def __init__(self):
+            super().__init__()
+            self.accept("vr-right-trigger", lambda c: c.vibrate(0.5, 0.05))
+
+    App().run()
+
+Or attach to an existing ShowBase with ``VRManager(base)``.
+"""
+
+__version__ = "2.0.0"
+
+from .controller import HANDS, Controller
+from .core import EYE_MASKS, XR_AVAILABLE, BaseVrApp, VRManager
+from .interaction import Interaction
+from .locomotion import Locomotion
+from .nodeIntersection import (
     BaseActor,
     BaseCollider,
+    CollisionReport,
+    CollisionWorld,
     ComplexActor,
     ComplexCollider,
-    CollisionReport,
+    Cube,
     CubeGenerator,
+    Mgr as NodeIntersection,
+    Sphere,
 )
+from .utils import File, Math, Misc
+
+VRApp = BaseVrApp
 
 __all__ = [
     "BaseVrApp",
-    "VrApi",
-    "xr",
-    "Math",
-    "File",
-    "Misc",
-    "Noise",
+    "VRApp",
+    "VRManager",
+    "Controller",
+    "HANDS",
+    "Locomotion",
+    "Interaction",
+    "XR_AVAILABLE",
+    "EYE_MASKS",
+    "CollisionWorld",
     "NodeIntersection",
     "Sphere",
+    "Cube",
+    "CubeGenerator",
     "BaseActor",
     "BaseCollider",
     "ComplexActor",
     "ComplexCollider",
     "CollisionReport",
-    "Cube",
-    "CubeGenerator",
-    "WANT_VR_INIT",
+    "Math",
+    "File",
+    "Misc",
 ]
-
-if __name__ == "__main__":
-    print("Panda3d VR Interface -- Version {VrApiVersion}")
