@@ -6,9 +6,6 @@ if sys.platform == "win32":
     import xr
 else:
     print("VR modules failed to load.")
-    if "a" == "b":
-        from OpenGL import GL
-        import xr
 import numpy as np
 import cv2
 from threading import Thread as _Thread
@@ -41,8 +38,6 @@ if sys.platform == "win32":
     import pyaudio
 else:
     print("Audio not yet supported on this platform.")
-    if "a" == "b":
-        import pyaudio  # type: ignore
 
 
 class Side(enum.IntEnum):
