@@ -204,6 +204,7 @@ class XrRuntime:
 
         self._fns = {}
         self._messenger = None
+        self._messenger_info = None
         self._debug_cb = None
 
         # Reusable per-frame structures.
@@ -225,13 +226,16 @@ class XrRuntime:
         ext = FEATURE_EXTENSIONS.get(feature, feature)
         return ext in self.enabled_extensions
 
-    def create_instance(self):
+    def create_instance(self, graphics_extensions=()):
         available = {
             e.extension_name.decode() for e in xr.enumerate_instance_extension_properties()
         }
         if xr.KHR_OPENGL_ENABLE_EXTENSION_NAME not in available:
             raise RuntimeError("The active OpenXR runtime does not support OpenGL")
-        wanted = [xr.KHR_OPENGL_ENABLE_EXTENSION_NAME]
+        missing = [e for e in graphics_extensions if e not in available]
+        if missing:
+            raise RuntimeError("The active OpenXR runtime lacks %s" % ", ".join(missing))
+        wanted = [xr.KHR_OPENGL_ENABLE_EXTENSION_NAME, *graphics_extensions]
         features = set(self.requested_features)
         for f in list(features):
             features.update(FEATURE_GROUPS.get(f, ()))
@@ -329,6 +333,9 @@ class XrRuntime:
             message_types=xr.DebugUtilsMessageTypeFlagsEXT(0xF),
             user_callback=self._debug_cb,
         )
+        # The loader keeps pointing into the create info until the messenger
+        # is destroyed; freeing it early crashes xrDestroyDebugUtilsMessengerEXT.
+        self._messenger_info = info
         self._messenger = xr.DebugUtilsMessengerEXT()
         pfn = self.fn("xrCreateDebugUtilsMessengerEXT", xr.PFN_xrCreateDebugUtilsMessengerEXT)
         try:
@@ -340,8 +347,8 @@ class XrRuntime:
 
     # ---------------------------------------------------------------- session
 
-    def create_session(self, hdc, hglrc, tracking="local_floor"):
-        binding = xr.GraphicsBindingOpenGLWin32KHR(h_dc=hdc, h_glrc=hglrc)
+    def create_session(self, binding, tracking="local_floor"):
+        """Start a session on the GL context described by ``binding``."""
         info = xr.SessionCreateInfo(
             next=cast(pointer(binding), c_void_p), system_id=self.system_id
         )
@@ -401,6 +408,7 @@ class XrRuntime:
             except Exception:
                 pass
             self._messenger = None
+            self._messenger_info = None
         if self.instance is not None:
             try:
                 xr.destroy_instance(self.instance)

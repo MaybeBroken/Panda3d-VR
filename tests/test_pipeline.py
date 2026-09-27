@@ -90,8 +90,8 @@ class FakeRuntime:
     def has(self, feature):
         return feature in self.features
 
-    def create_session(self, hdc, hglrc, tracking):
-        self.context = (hdc, hglrc)
+    def create_session(self, binding, tracking):
+        self.context = binding
         self.session = object()
         self.running = True
 
@@ -183,7 +183,7 @@ def test_frames_reach_swapchain_via_copy(base, make_vr):
     vr = make_vr([_gl.GL_SRGB8_ALPHA8, _gl.GL_RGBA8], msaa=0, submit_depth=False)
     _run(base)
     rt = vr.rt
-    assert rt.context is not None and all(rt.context), "session must be created inside Panda's GL context"
+    assert rt.context is not None, "session must be created inside Panda's GL context"
     assert rt.ended and rt.ended[-1] == 1, "one projection layer per frame"
     assert [sc.format for sc in rt.swapchains] == [_gl.GL_SRGB8_ALPHA8] * 2
     assert all(e.copier.mode == "copy" for e in vr._eyes)

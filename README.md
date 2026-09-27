@@ -1,6 +1,6 @@
 # Panda3d-VR
 
-OpenXR support for the [Panda3D](https://www.panda3d.org/) engine. It works with Meta Quest (Link / Air Link), Valve Index, HTC Vive, Windows Mixed Reality and any other OpenXR runtime on Windows.
+OpenXR support for the [Panda3D](https://www.panda3d.org/) engine. It works with Meta Quest (Link / Air Link), Valve Index, HTC Vive, Windows Mixed Reality and any other OpenXR runtime on Windows. Linux works through [WiVRn](https://github.com/WiVRn/WiVRn) or Monado (see [Linux](#linux)).
 
 Version 2 is a full rewrite. Frames now go from Panda to the headset entirely on the GPU, and the library covers the features you would expect from a modern OpenXR integration.
 
@@ -72,6 +72,20 @@ At native Quest 3 resolution, v1's transfer alone capped the app at about 24 fps
    ```
 
    Every project can then `import panda3d_vr`. The examples also run straight from the repository without installing.
+
+### Linux
+
+On Linux the session binds to an EGL context (`XR_MNDX_egl_enable`) rather than GLX: Monado-based runtimes only accept GLX frames through `GL_EXT_memory_object_fd`, which some drivers (Asahi on Apple Silicon) lack, while their EGL path can share images as dma-bufs. Panda's EGL desktop-GL pipe renders offscreen only, so:
+
+- `BaseVrApp` switches Panda to `load-display p3headlessgl` and `window-type offscreen` automatically when VR is enabled. With your own `ShowBase`, put those two lines in your PRC config before creating it.
+- There is no desktop window or mirror while VR is on. The keyboard/mouse simulator needs a window, so it only works with `vr=False`.
+
+For a Quest, install WiVRn (`sudo dnf install wivrn wivrn-dashboard` on Fedora), open the `wivrn` and `mdns` services in the firewall, start the server with `systemctl --user start wivrn`, and connect from the WiVRn app on the headset.
+
+Two platform problems you may hit:
+
+- **Apple Silicon (Asahi):** stock WiVRn/Monado imports swapchain dma-bufs without a format modifier, which Asahi rejects (`eglCreateImageKHR failed` / `XR_ERROR_RUNTIME_FAILURE in xrCreateSwapchain`). It needs a runtime built with a patch that passes the modifier explicitly. The patch also sets `XRT_EGL_DMABUF_MODIFIER` as an override for other drivers.
+- **pyopenxr on aarch64:** its wheel ships Android builds of `libopenxr_loader.so` and the API-layer libraries, which fail to load (`wrong ELF class` / `not page-aligned`). Point `xr/library/aarch64/libopenxr_loader.so` at the system loader (`/usr/lib64/libopenxr_loader.so.1`) and rebuild `libXrApiLayer_python.so` from pyopenxr's `src/generate/py_api_layer/py_api_layer.cpp`.
 
 ## Quick start
 
@@ -320,7 +334,7 @@ With an OpenXR runtime installed, the suite also validates every controller bind
 
 ## Limitations
 
-- Windows with OpenGL only. The OpenXR GL binding for Linux needs Xlib/EGL handles and isn't wired up yet.
+- OpenGL only: WGL on Windows, EGL on Linux (offscreen, no desktop mirror). macOS is not supported.
 - Panda's single-threaded render pipeline is assumed (the default).
 - Controller models are simple placeholders; parent your own models to `grip`.
 - Not implemented yet: `XR_FB_render_model`, space warp (which needs motion vectors) and foveated rendering (which requires Vulkan on PC).

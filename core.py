@@ -36,6 +36,7 @@ from panda3d.core import (
     FrameBufferProperties,
     GraphicsOutput,
     GraphicsPipe,
+    GraphicsWindow,
     NodePath,
     PandaNode,
     PerspectiveLens,
@@ -65,10 +66,10 @@ try:
     from .runtime import XrCallError, XrRuntime
     from .xrmath import apply_pose, fov_to_film
 
-    XR_AVAILABLE = sys.platform == "win32"
+    XR_AVAILABLE = sys.platform == "win32" or sys.platform.startswith("linux")
     _ALPHA_LAYER_FLAGS = (xr.CompositionLayerFlags.BLEND_TEXTURE_SOURCE_ALPHA_BIT
                           | xr.CompositionLayerFlags.UNPREMULTIPLIED_ALPHA_BIT).value
-    _XR_IMPORT_ERROR = None if XR_AVAILABLE else "only Windows is supported for now"
+    _XR_IMPORT_ERROR = None if XR_AVAILABLE else "only Windows and Linux are supported"
 except Exception as _e:  # pragma: no cover - missing pyopenxr / PyOpenGL
     XR_AVAILABLE = False
     _XR_IMPORT_ERROR = _e
@@ -262,7 +263,7 @@ class VRManager(DirectObject):
         self._submit_buffer = None
         self._prepare_buffer = None
         self._gsg = self.base.win.get_gsg()
-        self._hdc = self._hglrc = None
+        self._gl_context = None
         self._proj_layer = None
         self._mask_dirty = False
         self._mask_data = [None, None]
@@ -280,6 +281,9 @@ class VRManager(DirectObject):
         self._mirror_cards = []
         self._controller_models = []
         self._stats_text = None
+        if not isinstance(self.base.win, GraphicsWindow):
+            # Rendering offscreen (Linux EGL): there is no desktop to mirror to.
+            mirror = "none"
         self.set_mirror(mirror)
         if show_controllers:
             self.show_controller_models()
@@ -704,7 +708,7 @@ class VRManager(DirectObject):
                 features.update(("environment_depth", "scene"))
                 self.rt = XrRuntime(self.app_name, features, self.extensions, self.debug,
                                     self.blend_mode, self._on_xr_event)
-                self.rt.create_instance()
+                self.rt.create_instance(_gl.GRAPHICS_EXTENSIONS)
             if self.rt.try_get_system():
                 self._waiting_logged = False
                 self._on_system_ready()
@@ -1003,10 +1007,10 @@ class VRManager(DirectObject):
 
     def _create_session(self):
         rt = self.rt
-        self._hdc, self._hglrc = _gl.current_context()
+        self._gl_context = _gl.current_context()
         log.debug("GL %s", _gl.gl_version())
-        rt.create_session(self._hdc, self._hglrc, self.tracking)
-        _gl.ensure_current(self._hdc, self._hglrc)
+        rt.create_session(_gl.graphics_binding(self._gl_context), self.tracking)
+        _gl.ensure_current(self._gl_context)
         self._apply_floor_offset(rt.space_type)
 
         # Colour swapchains are sized to the eye textures; how each frame gets
@@ -1150,7 +1154,7 @@ class VRManager(DirectObject):
                 if q.visible and q.swapchain is not None and len(layers) < rt.max_layers:
                     layers.append(q._submit(rt, native, scale))
         rt.end_frame(fs.predicted_display_time, layers)
-        _gl.ensure_current(self._hdc, self._hglrc)
+        _gl.ensure_current(self._gl_context)
 
     def _do_teardown(self):
         mode = self._teardown
@@ -1463,6 +1467,10 @@ class BaseVrApp(ShowBase):
 
         # The headset paces the frame loop; desktop vsync would fight it.
         loadPrcFileData("panda3d-vr", "sync-video false\n")
+        if vr and XR_AVAILABLE and sys.platform.startswith("linux"):
+            # The XR session needs an EGL context (see _gl.py), and Panda's EGL
+            # desktop-GL pipe renders offscreen only, so there is no window.
+            loadPrcFileData("panda3d-vr-linux", "load-display p3headlessgl\nwindow-type offscreen\n")
         ShowBase.__init__(self)
         self.disableMouse()
         self.setBackgroundColor(0, 0, 0)

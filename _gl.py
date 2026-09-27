@@ -17,6 +17,17 @@ OpenGL.ERROR_CHECKING = False
 OpenGL.ERROR_LOGGING = False
 OpenGL.ERROR_ON_COPY = False
 
+if sys.platform.startswith("linux"):
+    # Panda's context is EGL on Linux (see below), so GL entry points must be
+    # resolved through EGL.  pyopenxr forces PyOpenGL onto GLX when imported,
+    # so import it first and then switch back, before OpenGL.GL binds anything.
+    import OpenGL.platform
+    import xr  # noqa: F401
+    from OpenGL.platform.egl import EGLPlatform
+
+    if not isinstance(OpenGL.platform.PLATFORM, EGLPlatform):
+        OpenGL.platform.PLATFORM = EGLPlatform()
+
 from OpenGL import GL  # noqa: E402
 
 GL_RGBA8 = 0x8058
@@ -68,22 +79,103 @@ if sys.platform == "win32":
     _wgl.wglMakeCurrent.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
     _wgl.wglMakeCurrent.restype = ctypes.c_int
 
+    GRAPHICS_EXTENSIONS = ()
+
     def current_context():
         """(HDC, HGLRC) of the context current on this thread."""
         return _wgl.wglGetCurrentDC(), _wgl.wglGetCurrentContext()
 
-    def ensure_current(hdc, hglrc):
+    def ensure_current(ctx):
         """Some runtimes switch contexts inside xr calls; put Panda's back."""
+        hdc, hglrc = ctx
         if _wgl.wglGetCurrentContext() != hglrc:
             _wgl.wglMakeCurrent(hdc, hglrc)
 
-else:  # pragma: no cover - OpenXR+GL on other platforms needs Xlib bindings
+    def graphics_binding(ctx):
+        import xr
+
+        hdc, hglrc = ctx
+        return xr.GraphicsBindingOpenGLWin32KHR(h_dc=hdc, h_glrc=hglrc)
+
+elif sys.platform.startswith("linux"):
+    # Linux goes through EGL (XR_MNDX_egl_enable) rather than GLX: Monado and
+    # WiVRn only take GLX frames via GL_EXT_memory_object_fd, which some
+    # drivers (Asahi on Apple Silicon) lack, while their EGL path can fall back
+    # to dma-buf EGLImages.  Panda must therefore render with p3headlessgl.
+    GRAPHICS_EXTENSIONS = ("XR_MNDX_egl_enable",)
+
+    _EGL_CONFIG_ID = 0x3028
+    _EGL_DRAW = 0x3059
+    _EGL_READ = 0x305A
+
+    _egl = ctypes.CDLL("libEGL.so.1")
+    for _name in ("eglGetCurrentDisplay", "eglGetCurrentContext", "eglGetCurrentSurface"):
+        getattr(_egl, _name).restype = ctypes.c_void_p
+    _egl.eglGetCurrentSurface.argtypes = (ctypes.c_int32,)
+    _egl.eglQueryContext.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
+                                     ctypes.POINTER(ctypes.c_int32))
+    _egl.eglChooseConfig.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                     ctypes.POINTER(ctypes.c_void_p), ctypes.c_int32,
+                                     ctypes.POINTER(ctypes.c_int32))
+    _egl.eglMakeCurrent.argtypes = (ctypes.c_void_p,) * 4
+    _egl.eglGetProcAddress.restype = ctypes.c_void_p
+    _egl.eglGetProcAddress.argtypes = (ctypes.c_char_p,)
 
     def current_context():
-        raise NotImplementedError("Only the Win32 OpenGL binding is implemented")
+        """(EGLDisplay, EGLConfig, EGLContext, draw, read) current on this thread."""
+        ctx = _egl.eglGetCurrentContext()
+        if not ctx:
+            raise RuntimeError(
+                "No EGL context is current.  On Linux Panda must render through EGL: "
+                "put 'load-display p3headlessgl' and 'window-type offscreen' in your "
+                "PRC config (BaseVrApp does this automatically)")
+        dpy = _egl.eglGetCurrentDisplay()
+        config_id = ctypes.c_int32(0)
+        _egl.eglQueryContext(dpy, ctx, _EGL_CONFIG_ID, ctypes.byref(config_id))
+        config = ctypes.c_void_p()
+        if config_id.value:
+            attribs = (ctypes.c_int32 * 3)(_EGL_CONFIG_ID, config_id.value, 0x3038)  # EGL_NONE
+            count = ctypes.c_int32(0)
+            _egl.eglChooseConfig(dpy, attribs, ctypes.byref(config), 1, ctypes.byref(count))
+            if not count.value:
+                config = ctypes.c_void_p()
+        # A context made with EGL_KHR_no_config_context has no config; the
+        # runtime only needs one for its own shared context, and accepts NULL.
+        return (dpy, config.value, ctx,
+                _egl.eglGetCurrentSurface(_EGL_DRAW), _egl.eglGetCurrentSurface(_EGL_READ))
 
-    def ensure_current(hdc, hglrc):
+    def ensure_current(ctx):
+        """Some runtimes switch contexts inside xr calls; put Panda's back."""
+        dpy, _config, context, draw, read = ctx
+        if _egl.eglGetCurrentContext() != context:
+            _egl.eglMakeCurrent(dpy, draw, read, context)
+
+    def graphics_binding(ctx):
+        import xr
+
+        dpy, config, context = ctx[:3]
+        binding = xr.GraphicsBindingEGLMNDX()
+        binding.get_proc_address = xr.PFN_xrEglGetProcAddressMNDX(
+            ctypes.cast(_egl.eglGetProcAddress, ctypes.c_void_p).value)
+        # The handle fields are PyOpenGL's opaque EGL pointer types.
+        fields = dict(xr.GraphicsBindingEGLMNDX._fields_)
+        binding.display = ctypes.cast(dpy, fields["display"])
+        binding.config = ctypes.cast(config, fields["config"])
+        binding.context = ctypes.cast(context, fields["context"])
+        return binding
+
+else:  # pragma: no cover
+
+    GRAPHICS_EXTENSIONS = ()
+
+    def current_context():
+        raise NotImplementedError("OpenXR is only implemented for Windows and Linux")
+
+    def ensure_current(ctx):
         pass
+
+    def graphics_binding(ctx):
+        raise NotImplementedError("OpenXR is only implemented for Windows and Linux")
 
 
 def gl_version():

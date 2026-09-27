@@ -28,6 +28,9 @@ def base():
     from direct.showbase.ShowBase import ShowBase
 
     loadPrcFileData("tests", "window-type offscreen\nsync-video false\naudio-library-name null\n")
+    if sys.platform.startswith("linux"):
+        # The XR session binds to an EGL context on Linux (see _gl.py).
+        loadPrcFileData("tests", "load-display p3headlessgl\n")
     b = ShowBase()
     yield b
     b.destroy()
