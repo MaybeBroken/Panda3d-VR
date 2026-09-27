@@ -5,3 +5,4 @@ __pycache__/
 !docs/*.png
 *.egg-info/
 build/
+dist/
