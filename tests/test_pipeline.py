@@ -486,6 +486,16 @@ def test_mcshader_stereo(base, make_vr):
         assert np.abs(left - right).mean() > 1e-3, "each eye rendered from its own camera"
         assert len(depth) == 2 and (depth[0].pixels < 1.0).any(), "scene depth submitted"
         assert not vr._eyes[0].buffer.is_active()
+        # Screen-only camera effects are off in the headset...
+        opts = app.pipe.options
+        for name, value in app.vr.option_overrides.items():
+            if name in opts.options:
+                assert str(opts.get(name)).lower() == str(value).lower(), name
+        saved = dict(app.vr._saved_options)
+        app.vr.detach()
+        # ...and the user's own values come back with the window.
+        for name, value in saved.items():
+            assert str(opts.get(name)).lower() == str(value).lower(), name
     finally:
         app.vr.detach()
         base.taskMgr.remove("mcshader-pipeline-uniforms")

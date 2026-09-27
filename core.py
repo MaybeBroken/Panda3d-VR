@@ -789,8 +789,9 @@ class VRManager(DirectObject):
                 eye.active = False
         self._clear_color = None
         self.stats["eye_size"] = (w, h)
-        log.info("Eye buffers: %dx%d, %sx MSAA, depth submission %s",
-                 w, h, self.msaa or "no", "on" if self.submit_depth else "off")
+        log.info("Eye buffers: %dx%d, %s, depth submission %s", w, h,
+                 "%dx MSAA" % self.msaa if self.msaa > 1 else "no MSAA",
+                 "on" if self.submit_depth else "off")
         self._update_mirror()
         self.eyes_ready = True
         self._deferred.append(("vr-eyes-ready", [self]))
