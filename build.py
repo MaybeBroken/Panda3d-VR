@@ -173,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         check()
-    if args.install:
+    if args.install or not args.sdist:  # wheel is the default, so install if no sdist-only
         install()
     return 0
 
