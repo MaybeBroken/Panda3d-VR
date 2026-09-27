@@ -142,6 +142,8 @@ class Passthrough:
     def __init__(self, rt, enabled=True):
         self.rt = rt
         self.enabled = enabled
+        self.feed_running = False
+        self.keep_feed = False  # environment depth needs the camera feed
         self.handle = None
         self.layer_handle = None
         self.layer = None
@@ -165,6 +167,16 @@ class Passthrough:
             flags=xr.CompositionLayerFlags.BLEND_TEXTURE_SOURCE_ALPHA_BIT,
             layer_handle=self.layer_handle)
         self.ptr = rt.layer_pointer(self.layer)
+        self.feed_running = bool(running)
+
+    def start_feed(self):
+        """Run the camera feed without necessarily showing the layer
+        (environment depth is computed from it)."""
+        self.keep_feed = True
+        if self.handle is not None and not self.feed_running:
+            check(self.rt.fn("xrPassthroughStartFB", xr.PFN_xrPassthroughStartFB)(self.handle),
+                  "xrPassthroughStartFB")
+            self.feed_running = True
 
     def set_enabled(self, enabled):
         self.enabled = enabled
@@ -172,15 +184,19 @@ class Passthrough:
             return
         rt = self.rt
         if enabled:
-            check(rt.fn("xrPassthroughStartFB", xr.PFN_xrPassthroughStartFB)(self.handle),
-                  "xrPassthroughStartFB")
+            if not self.feed_running:
+                check(rt.fn("xrPassthroughStartFB", xr.PFN_xrPassthroughStartFB)(self.handle),
+                      "xrPassthroughStartFB")
+                self.feed_running = True
             check(rt.fn("xrPassthroughLayerResumeFB", xr.PFN_xrPassthroughLayerResumeFB)(
                 self.layer_handle), "xrPassthroughLayerResumeFB")
         else:
             check(rt.fn("xrPassthroughLayerPauseFB", xr.PFN_xrPassthroughLayerPauseFB)(
                 self.layer_handle), "xrPassthroughLayerPauseFB")
-            check(rt.fn("xrPassthroughPauseFB", xr.PFN_xrPassthroughPauseFB)(self.handle),
-                  "xrPassthroughPauseFB")
+            if self.feed_running and not self.keep_feed:
+                check(rt.fn("xrPassthroughPauseFB", xr.PFN_xrPassthroughPauseFB)(self.handle),
+                      "xrPassthroughPauseFB")
+                self.feed_running = False
 
     def set_opacity(self, opacity, edge_color=(0, 0, 0, 0)):
         if self.layer_handle is None:

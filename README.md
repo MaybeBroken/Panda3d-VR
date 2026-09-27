@@ -16,6 +16,9 @@ Version 2 is a full rewrite. Frames now go from Panda to the headset entirely on
 - Hidden-area mesh (`XR_KHR_visibility_mask`), so the GPU skips pixels the lenses can't show.
 - Quad layers: UI panels composited by the runtime at full display sharpness.
 - Passthrough (`XR_FB_passthrough`) and alpha-blend / additive environment modes.
+- The Quest's live depth sensing (`XR_META_environment_depth`) as a Panda texture, with automatic real-world occlusion of virtual objects.
+- The Space Setup room scan (`XR_FB_scene`, `XR_META_spatial_entity_mesh`) as Panda geometry: the room mesh plus labelled walls, floor, ceiling and furniture.
+- External renderers (such as mcshader's Minecraft shaderpacks) can supply the eye images themselves.
 - Eye rendering is skipped automatically when the runtime says the frame won't be shown.
 - Desktop mirror: `left`, `right`, `both`, `spectator` (first-person Panda camera) or `none`.
 
@@ -62,11 +65,13 @@ At native Quest 3 resolution, v1's transfer alone capped the app at about 24 fps
 ## Installation
 
 1. Install the runtime for your headset. For Quest, install [Meta Quest Link](https://www.meta.com/help/quest/pcvr/) and set it as the active OpenXR runtime.
-2. Install the Python dependencies:
+2. From this repository, install it as the `panda3d_vr` package. The `-e` flag keeps it pointing at the repository, so your edits apply immediately:
+
    ```
-   pip install -r requirements.txt
+   pip install -e .
    ```
-3. Clone this repository and import the folder as a package. Because the folder name has a hyphen, clone it into a folder with a valid name, for example `git clone ... panda3d_vr`. See `examples/demo.py` for loading it in place.
+
+   Every project can then `import panda3d_vr`. The examples also run straight from the repository without installing.
 
 ## Quick start
 
@@ -161,6 +166,10 @@ VRManager(base, custom_actions={
 | `vr-<hand>-hand-tracked` / `-lost` | hand | |
 | `vr-<hand>-pinch` / `-pinch-up` | hand | |
 | `vr-refresh-rate-changed` | Hz | |
+| `vr-eyes-ready` | vr | eye cameras and `eye_size` exist (again whenever they change); the moment to build an external renderer |
+| `vr-scene-loaded` | SceneModel | the Space Setup room is in `vr.scene` |
+| `vr-scene-capture-complete` | vr | the user finished Space Setup |
+| `vr-feature-disabled` | name, reason | a mixed-reality feature was refused or switched off by the stall watchdog |
 | `vr-teleport` | point | Locomotion |
 | `vr-grab`, `vr-release` | np, controller (+ world velocity) | Interaction |
 | `vr-pointer-enter` / `-exit` / `-click` | np, controller (+ point) | Interaction |
@@ -182,6 +191,8 @@ VRManager(base, custom_actions={
 | `visibility_mask` | True | hidden-area mesh |
 | `hand_tracking`, `eye_tracking` | True | used when the runtime supports them |
 | `passthrough` | False | start with passthrough on (`vr.set_passthrough()` toggles it) |
+| `environment_depth` | False | start depth sensing; `"occlusion"` also lets real objects hide virtual ones |
+| `scene` | False | load the Space Setup room model once the app has focus |
 | `blend_mode` | `"opaque"` | `"additive"` or `"alpha_blend"` for AR headsets |
 | `refresh_rate` | None | request a rate in Hz |
 | `fallback` | `"simulator"` | `None` for no simulator |
@@ -201,6 +212,63 @@ Other calls:
 - `vr.enable_debug_keys()`: `r` recenters, `v` cycles the mirror mode, `F3` toggles stats, `p` toggles passthrough
 - `vr.request_exit()`
 - `vr.destroy()`
+
+## Mixed reality
+
+```python
+app = BaseVrApp(passthrough=True, environment_depth="occlusion", scene=True)
+```
+
+### Environment depth
+
+`vr.environment_depth` holds the headset's live depth map of the real world:
+
+- `texture` is a Panda 2D texture array: layer 0 is the left eye, layer 1 the right. It's refreshed on the GPU every frame.
+- `views[i]` (NodePaths) and `fov[i]` describe the depth camera that produced each layer. `near`, `far` and `params` linearise its values; `GLSL_LINEAR_DEPTH` has the matching shader helper.
+- `set_occlusion(True)` writes real-world depth into each eye before the scene draws. Real furniture, walls and people then hide virtual objects behind them. This works with any shaders.
+- `set_hand_removal(True)` leaves your hands out of the depth map.
+- `read_depth()` returns a `(2, H, W)` array of metres on the CPU. `world_point(eye, u, v, metres)` turns an image position into a world point, for gameplay such as placing objects on real surfaces.
+- `shader_inputs(np)` binds everything a custom shader needs to do its own occlusion.
+
+You can also start it later with `vr.enable_environment_depth(occlusion=True)`.
+
+### Room model
+
+`vr.scene` holds the room from Space Setup:
+
+- `mesh` is the room's triangle mesh.
+- `anchors` hold each scanned entity, with its `labels` (`FLOOR`, `WALL_FACE`, `TABLE`, `COUCH`...), `plane` or `volume` extents, and a NodePath placed in the room.
+- `by_label("TABLE")` finds entities by label.
+- `show()` displays everything as a coloured overlay.
+
+It loads when the app gains focus; `vr-scene-loaded` fires when it's in. `vr.request_scene_capture()` opens Space Setup in the headset.
+
+Over Link, enable "Passthrough over Meta Quest Link" and "Spatial data over Meta Quest Link" in the Meta Quest Link app. `examples/environment_probe.py` checks both with the headset on.
+
+### Startup safety
+
+Over Link, depth sensing is computed from the passthrough cameras. Starting it without that feed, or before frames are flowing, can stall the runtime badly enough to drop the Link connection. To guard against this:
+
+- Environment depth only starts once the session has been focused for a moment, and only while the passthrough feed is running. Without passthrough it logs why and stays off.
+- Depth and the room model start one at a time. Each is watched for 20 seconds and switched off if:
+  - frames stall (two frames over 0.5 s),
+  - the frame rate drops for good (average frame time more than 1.4× what it was before the feature started), or
+  - (depth only) the runtime delivers no depth image within 4 seconds. Over Link, that happens when the runtime has passthrough disabled for this PC ("Compositor passthrough is disabled (device compatibility)" in the Oculus service log): depth can't work, but the runtime's depth service still halves the frame rate.
+
+  When that happens, `vr-feature-disabled` fires with the feature's name and the reason, and the app keeps running.
+
+If a runtime still misbehaves, run `examples/mr_diagnostics.py` with the headset on. It enables each step in turn (passthrough, depth provider, depth acquire, GPU copy, occlusion, room model), times the frames, and stops cleanly at the first stall with a report.
+
+## External renderers
+
+A renderer with its own pipeline, such as a deferred shading chain or mcshader's Minecraft shaderpacks, can supply the eye images itself:
+
+1. On `vr-eyes-ready`, render through `vr.eye_cameras[i]` (VRManager keeps their pose and exact per-eye lens current) into textures of `vr.eye_size`.
+2. Call `vr.set_eye_source(i, color_texture, depth_texture=None)`.
+
+The built-in eye rendering then idles, and your textures reach the headset through the same GPU copy (or a blit, when formats differ). `vr.get_hidden_area_camera(i)` gives the lens-mask pass to draw first, and `vr.clear_eye_sources()` switches back.
+
+With mcshader, all of that is one argument: `mcshader.init(base, pack=..., vr=vr)`.
 
 ## Desktop simulator
 
@@ -239,14 +307,16 @@ python -m pytest
 
 The suite doesn't need a headset. A fake runtime backed by real GL textures checks what actually reaches the swapchain:
 
-- the copy and blit paths
+- the copy and blit paths, including external eye sources
+- environment depth: the copy, CPU readback and real-world occlusion
+- each eye's lens mask staying out of the other eye
 - MSAA resolve
 - depth values
 - quad layers
 - visibility masks
 - skipped frames
 
-With an OpenXR runtime installed, the suite also validates every controller binding profile against it.
+With an OpenXR runtime installed, the suite also validates every controller binding profile against it. To include the end-to-end mcshader test, set `MCSHADER_PACK` to a shaderpack `.zip` with mcshader importable. It renders the pack per eye and checks what reaches the headset.
 
 ## Limitations
 

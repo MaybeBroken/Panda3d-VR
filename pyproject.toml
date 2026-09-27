@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panda3d-vr"
+version = "2.1.0"
+description = "OpenXR for Panda3D: zero-copy stereo rendering, tracking, input, hand tracking, passthrough, environment depth and the Quest room model."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "MaybeBroken" }]
+dependencies = ["panda3d>=1.10.13", "pyopenxr>=1.0.3000", "PyOpenGL>=3.1.6", "numpy>=1.23"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+# The repository root *is* the package, so it installs as ``panda3d_vr``
+# (``pip install -e .`` for development).
+[tool.setuptools]
+package-dir = { "panda3d_vr" = ".", "panda3d_vr.nodeIntersection" = "nodeIntersection" }
+packages = ["panda3d_vr", "panda3d_vr.nodeIntersection"]

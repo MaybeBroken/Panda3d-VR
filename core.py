@@ -20,6 +20,7 @@ thread; that round trip is gone entirely.
 
 import atexit
 import builtins
+import collections
 import logging
 import sys
 import time
@@ -32,7 +33,6 @@ from panda3d.core import (
     ClockObject,
     ConfigVariableBool,
     ConfigVariableString,
-    CullBinManager,
     FrameBufferProperties,
     GraphicsOutput,
     GraphicsPipe,
@@ -60,6 +60,7 @@ try:
     from . import _gl
     from .hands import HandTracking
     from .input import XrInput
+    from .environment import EnvironmentDepth, SceneModel
     from .layers import Passthrough, QuadLayer
     from .runtime import XrCallError, XrRuntime
     from .xrmath import apply_pose, fov_to_film
@@ -74,19 +75,20 @@ except Exception as _e:  # pragma: no cover - missing pyopenxr / PyOpenGL
 
 __all__ = ["VRManager", "BaseVrApp", "XR_AVAILABLE", "EYE_MASKS"]
 
-# Camera-mask bits reserved for the eyes; used to keep each eye's
-# hidden-area mesh out of the other eye (and out of the desktop camera).
+# Camera-mask bits reserved for the eyes.  Each eye camera lacks the other
+# eye's bit, so ``np.hide(BitMask32.all_on()); np.show(EYE_MASKS[0])`` shows a
+# node to the left eye only (see VRManager.show_only_to_eye).
 EYE_MASKS = (BitMask32.bit(28), BitMask32.bit(29))
 
 MIRROR_MODES = ("left", "right", "both", "spectator", "none")
 
-_MASK_BIN = "vr-hidden-area"
 
 
 class _Eye:
     __slots__ = (
         "index", "cam", "lens", "buffer", "region", "color_tex", "depth_tex",
-        "swapchain", "copier", "depth_swapchain", "depth_copier", "mask",
+        "swapchain", "copier", "depth_swapchain", "depth_copier", "mask", "mask_root",
+        "mask_cam", "source", "source_depth", "copier_src", "depth_src",
         "fov_key", "active",
     )
 
@@ -123,6 +125,10 @@ class VRManager(DirectObject):
         hand_tracking     Articulated hand tracking when supported.
         eye_tracking      Eye gaze pose when supported.
         passthrough       Start with Meta passthrough behind the scene.
+        environment_depth Start the Quest's live depth sensing
+                          (``vr.environment_depth``); "occlusion" also lets
+                          real objects hide virtual ones.
+        scene             Load the Space Setup room model (``vr.scene``).
         blend_mode        "opaque", "additive" or "alpha_blend" (AR headsets).
         refresh_rate      Request a display refresh rate (Hz) when supported.
         fallback          "simulator" (keyboard/mouse) or None when no headset.
@@ -152,6 +158,8 @@ class VRManager(DirectObject):
         hand_tracking=True,
         eye_tracking=True,
         passthrough=False,
+        environment_depth=False,
+        scene=False,
         blend_mode="opaque",
         refresh_rate=None,
         fallback="simulator",
@@ -182,6 +190,8 @@ class VRManager(DirectObject):
         self.want_hand_tracking = hand_tracking
         self.want_eye_tracking = eye_tracking
         self.want_passthrough = passthrough
+        self.want_environment_depth = bool(environment_depth)
+        self.want_scene = scene
         self.blend_mode = blend_mode
         self.requested_refresh_rate = refresh_rate
         self.exit_on_session_end = exit_on_session_end
@@ -225,10 +235,23 @@ class VRManager(DirectObject):
         self.rt = None
         self.input = None
         self.passthrough = None
+        self.environment_depth = EnvironmentDepth(self) if XR_AVAILABLE else None
+        if environment_depth == "occlusion":
+            self.environment_depth.occlusion = True
+        self.scene = SceneModel(self) if XR_AVAILABLE else None
+        self._env_create_pending = False
+        # Mixed-reality features start one at a time, once frames are flowing,
+        # under a stall watchdog (see `_start_mr_features` / `_watch_stalls`).
+        self._guard = None
+        self._mr_failed = set()
+        self._focused_frames = 0
+        self._last_frame = None
+        self._intervals = collections.deque(maxlen=240)
         self.status = "disabled" if not enabled else "disconnected"
         self._enabled = enabled
         self._quad_layers = []
         self._pending_quads = []
+        self.eyes_ready = False
         self._deferred = []  # (event name | callable, args) raised from the GL callback
         self._session_requested = False
         self._frame_open = False
@@ -237,6 +260,7 @@ class VRManager(DirectObject):
         self._next_connect = 0.0
         self._waiting_logged = False
         self._submit_buffer = None
+        self._prepare_buffer = None
         self._gsg = self.base.win.get_gsg()
         self._hdc = self._hglrc = None
         self._proj_layer = None
@@ -250,8 +274,6 @@ class VRManager(DirectObject):
             "fps": 0.0, "xr_wait_ms": 0.0, "refresh_rate": 0.0, "frames": 0,
             "skipped": 0, "eye_size": (0, 0),
         }
-
-        CullBinManager.get_global_ptr().add_bin(_MASK_BIN, CullBinManager.BT_fixed, -100)
 
         self.simulator = DesktopSimulator(self, eye_height=eye_height) if fallback == "simulator" else None
         self.mirror = None
@@ -412,6 +434,75 @@ class VRManager(DirectObject):
         else:
             self.base.userExit()
 
+    def enable_environment_depth(self, occlusion=None, hand_removal=None):
+        """Start live depth sensing (XR_META_environment_depth).
+
+        ``occlusion=True`` writes real-world depth into the eye buffers so real
+        objects hide virtual ones (pair with passthrough).  ``hand_removal``
+        leaves the user's hands out of the depth map.
+        """
+        env = self.environment_depth
+        if env is None:
+            return False
+        self.want_environment_depth = True
+        self._mr_failed.discard("environment_depth")
+        if hand_removal is not None:
+            env.set_hand_removal(hand_removal)
+        if occlusion is not None:
+            env.set_occlusion(occlusion)
+        # Started by the frame task once the session is focused and stable.
+        return self.rt is None or self.rt.has("environment_depth")
+
+    def load_scene(self):
+        """Load the Space Setup room model; fires ``vr-scene-loaded``."""
+        self.want_scene = True
+        self._mr_failed.discard("scene")
+        if self.scene is not None:
+            self.scene.loaded = False  # (re)loaded by the frame task once focused
+        return self.scene is not None
+
+    def request_scene_capture(self):
+        """Open Space Setup in the headset so the user can scan their room."""
+        return self.scene.request_capture() if self.scene is not None else False
+
+    @property
+    def eye_size(self):
+        """(width, height) of each eye image, once a headset is connected."""
+        return self.stats["eye_size"]
+
+    def set_eye_source(self, eye, color, depth=None):
+        """Submit ``color`` (and optionally ``depth``) for ``eye`` instead of the
+        built-in rendering -- the hook for external pipelines such as mcshader.
+
+        The texture must be ``eye_size`` and rendered with ``eye_cameras[eye]``
+        (whose lens and pose VRManager keeps current). Pass ``None`` to go back
+        to the built-in eye buffer. Listen for ``vr-eyes-ready`` to know when
+        eye cameras/sizes exist (and again whenever they change).
+        """
+        e = self._eyes[eye]
+        e.source = color
+        e.source_depth = depth if color is not None else None
+        if e.buffer is not None:
+            want = color is None and self.running
+            e.buffer.set_active(want)
+            e.active = want
+        self._update_mirror()
+
+    def clear_eye_sources(self):
+        for i in range(len(self._eyes)):
+            self.set_eye_source(i, None)
+
+    def get_hidden_area_camera(self, eye):
+        """Camera drawing this eye's hidden-area mesh (depth at the near plane,
+        black colour) -- add it as an extra display region before the scene in
+        an external pipeline to skip pixels the lenses can't show."""
+        return self._eyes[eye].mask_cam
+
+    def show_only_to_eye(self, np, eye):
+        """Make ``np`` render in one eye only (0 = left, 1 = right)."""
+        np.hide(BitMask32.all_on())
+        np.show(EYE_MASKS[eye])
+
     def get_eye_texture(self, eye=0):
         return self._eyes[eye].color_tex
 
@@ -440,7 +531,8 @@ class VRManager(DirectObject):
             cm = CardMaker("vr-mirror-%d" % i)
             cm.set_frame(-1, 1, -1, 1)
             card = self.base.render2d.attach_new_node(cm.generate())
-            card.set_texture(self._eyes[i].color_tex, 1)
+            eye = self._eyes[i]
+            card.set_texture(eye.source if eye.source is not None else eye.color_tex, 1)
             card.set_bin("background", -100)
             card.set_depth_write(False)
             card.set_depth_test(False)
@@ -579,6 +671,19 @@ class VRManager(DirectObject):
             messenger.send("vr-refresh-rate-changed", [data["new"]])
         elif name == "user-presence":
             messenger.send("vr-user-presence", [data["present"]])
+        elif name in ("space-query-results", "space-query-complete"):
+            if self.scene is not None:
+                try:
+                    if name == "space-query-results":
+                        self.scene.on_results(data["request_id"])
+                    else:
+                        self.scene.on_complete(data["request_id"])
+                except Exception as e:
+                    self._disable_mr_feature("scene", "loading failed: %s" % e)
+        elif name == "scene-capture-complete":
+            messenger.send("vr-scene-capture-complete", [self])
+            if self.want_scene:
+                self.load_scene()
         elif name == "performance-notification":
             messenger.send("vr-performance-notification", [data])
 
@@ -595,6 +700,8 @@ class VRManager(DirectObject):
                     features.add("eye_gaze")
                 # Always requested so passthrough can be toggled on later.
                 features.add("passthrough")
+                # Always requested so they can be switched on at runtime.
+                features.update(("environment_depth", "scene"))
                 self.rt = XrRuntime(self.app_name, features, self.extensions, self.debug,
                                     self.blend_mode, self._on_xr_event)
                 self.rt.create_instance()
@@ -624,6 +731,7 @@ class VRManager(DirectObject):
             self._create_eye_buffers(w, h)
         if self._submit_buffer is None:
             self._create_submit_buffer()
+            self._create_prepare_buffer()
         self._session_requested = True
         self.status = "connected"
         self._set_simulated(False)
@@ -663,12 +771,179 @@ class VRManager(DirectObject):
             eye.buffer.set_clear_depth_active(True)
             eye.region = eye.buffer.make_display_region()
             eye.region.set_camera(eye.cam)
+            # The hidden-area mesh lives in its own tiny scene, drawn by an earlier
+            # display region with a camera sharing the eye's lens.  Nothing else can
+            # see it: in the shared scene graph it would also show up in the other
+            # eye (camera masks match on *any* common bit), just past that eye's near
+            # plane -- which is exactly where it appeared, by the nose.
+            eye.mask_root = NodePath("vr-hidden-area-scene-%d" % eye.index)
+            mask_cam = Camera("vr-hidden-area-cam-%d" % eye.index, eye.lens)
+            mask_cam.set_scene(eye.mask_root)
+            mask_region = eye.buffer.make_display_region()
+            mask_region.set_sort(-10)
+            eye.mask_cam = eye.mask_root.attach_new_node(mask_cam)
+            mask_region.set_camera(eye.mask_cam)
             eye.active = True
+            if eye.source is not None:
+                eye.buffer.set_active(False)
+                eye.active = False
         self._clear_color = None
         self.stats["eye_size"] = (w, h)
         log.info("Eye buffers: %dx%d, %sx MSAA, depth submission %s",
                  w, h, self.msaa or "no", "on" if self.submit_depth else "off")
         self._update_mirror()
+        self.eyes_ready = True
+        self._deferred.append(("vr-eyes-ready", [self]))
+
+    def _create_prepare_buffer(self):
+        # Renders before the eyes: its draw callback moves this frame's
+        # environment-depth image into Panda's texture, and its scene draws
+        # the keep-alive cards that make Panda allocate such textures.
+        buf = self._make_buffer("vr-prepare", 16, 16, -1000, 0, Texture("vr-prepare"))
+        buf.set_clear_color_active(True)
+        self._prepare_scene = NodePath("vr-prepare-scene")
+        cam = Camera("vr-prepare-cam")
+        cam.set_scene(self._prepare_scene)
+        dr = buf.make_display_region()
+        dr.set_camera(self._prepare_scene.attach_new_node(cam))
+        dr.set_draw_callback(PythonCallbackObject(self._prepare_callback))
+        self._prepare_buffer = buf
+
+    def _prepare_callback(self, cbdata):
+        cbdata.upcall()
+        env = self.environment_depth
+        if env is not None and env.provider is not None:
+            try:
+                env.copy(self._native_id)
+            except Exception as e:
+                log.warning("Environment depth disabled: %s", e, exc_info=self.debug)
+                env.destroy()
+
+    def _create_environment_depth(self):
+        env = self.environment_depth
+        try:
+            env.create(self.rt, self._prepare_scene)
+        except Exception as e:
+            log.warning("Environment depth unavailable: %s", e)
+            env.destroy()
+            self._mr_failed.add("environment_depth")
+            self._guard = None
+            return
+        self._deferred.append((env.attach_occluders, [self._eyes]))
+
+    # ------------------------------------------------ mixed reality safety
+
+    #: Frames the session must have been focused before MR features start.
+    MR_SETTLE_FRAMES = 45
+    #: A frame slower than this counts as a stall while a feature is on probation.
+    STALL_SECONDS = 0.5
+    #: How long a newly started feature is watched.
+    PROBATION_SECONDS = 20.0
+    #: Average frame time may grow by at most this factor once a feature starts.
+    MAX_SLOWDOWN = 1.4
+    #: Environment depth must deliver its first image within this many seconds.
+    DEPTH_DATA_TIMEOUT = 4.0
+
+    def _start_mr_features(self, now):
+        """Start requested MR features one at a time, each under the watchdog."""
+        rt = self.rt
+        if self._guard is not None or self._env_create_pending:
+            return
+        env = self.environment_depth
+        if (self.want_environment_depth and env is not None and env.provider is None
+                and "environment_depth" not in self._mr_failed and rt.has("environment_depth")):
+            if self.passthrough is None:
+                self._mr_failed.add("environment_depth")
+                log.warning("Environment depth not started: it needs the passthrough camera feed, "
+                            "which is unavailable. Over Link, enable \"Passthrough over Meta Quest "
+                            "Link\" in the Link app (Settings > Beta).")
+                messenger.send("vr-feature-disabled", ["environment_depth", "no passthrough"])
+                return
+            try:
+                self.passthrough.start_feed()
+            except Exception as e:
+                self._mr_failed.add("environment_depth")
+                log.warning("Environment depth not started: passthrough feed failed (%s)", e)
+                return
+            log.info("Starting environment depth (watching for stalls)")
+            self._env_create_pending = True
+            self._guard = ["environment_depth", now, 0, self._baseline_interval()]
+            return
+        scene = self.scene
+        if (self.want_scene and scene is not None and not scene.loaded and not scene._requests
+                and "scene" not in self._mr_failed and rt.has("scene")):
+            if scene.load():
+                self._guard = ["scene", now, 0, self._baseline_interval()]
+            else:
+                self._mr_failed.add("scene")
+
+    def _baseline_interval(self):
+        recent = list(self._intervals)[-90:]
+        return sorted(recent)[len(recent) // 2] if len(recent) >= 30 else None
+
+    def _watch_stalls(self, now):
+        """Frame-to-frame watchdog for a just-started MR feature. It is switched
+        off (before the runtime, and Link, go down with it) when it
+
+        * stalls frames outright (two frames over STALL_SECONDS),
+        * slows the frame rate down for good (average frame time more than
+          MAX_SLOWDOWN times what it was before the feature started), or
+        * is environment depth and never delivers an image -- over Link that
+          means the passthrough cameras aren't available, and the runtime's
+          depth service then just burns frame time.
+        """
+        last, self._last_frame = self._last_frame, now
+        if last is None:
+            return
+        interval = now - last
+        self._intervals.append(interval)
+        st = self.stats
+        st["frame_ms_max"] = max(st.get("frame_ms_max", 0.0), interval * 1000.0)
+        guard = self._guard
+        if guard is None:
+            return
+        name, started, stalls, baseline = guard
+        age = now - started
+        if age > self.PROBATION_SECONDS:
+            log.info("%s stable", name.replace("_", " ").capitalize())
+            self._guard = None
+            return
+        if interval > self.STALL_SECONDS:
+            guard[2] = stalls + 1
+            log.warning("%s: %.0f ms frame (stall %d)", name, interval * 1000.0, guard[2])
+            if guard[2] >= 2:
+                self._disable_mr_feature(name, "frames stalled for %.1f s" % interval)
+                return
+        env = self.environment_depth
+        if (name == "environment_depth" and env is not None and env.provider is not None
+                and env.frame == 0 and age > self.DEPTH_DATA_TIMEOUT):
+            self._disable_mr_feature(
+                name, "the runtime delivered no depth images in %.0f s (over Link this means the "
+                "passthrough cameras aren't available to PC apps)" % age)
+            return
+        if baseline and age > 3.0:
+            recent = list(self._intervals)[-45:]
+            avg = sum(recent) / len(recent)
+            if avg > baseline * self.MAX_SLOWDOWN:
+                self._disable_mr_feature(
+                    name, "frame rate fell from %.0f to %.0f fps" % (1.0 / baseline, 1.0 / avg))
+
+    def _disable_mr_feature(self, name, reason):
+        self._guard = None
+        self._mr_failed.add(name)
+        if name == "environment_depth":
+            self.want_environment_depth = False
+            self._env_create_pending = False
+            env = self.environment_depth
+            env.destroy()
+            self._deferred.append((env.detach_occluders, []))
+        elif name == "scene":
+            self.want_scene = False
+            self.scene.destroy()
+        log.error("Disabled %s: %s. The runtime could not keep up with it; on Link this is "
+                  "usually passthrough/spatial data being unavailable or the link being "
+                  "saturated.", name.replace("_", " "), reason)
+        messenger.send("vr-feature-disabled", [name, reason])
 
     def _create_submit_buffer(self):
         tex = Texture("vr-submit")
@@ -686,9 +961,10 @@ class VRManager(DirectObject):
 
     def _set_eyes_active(self, active):
         for eye in self._eyes:
-            if eye.buffer is not None and eye.active != active:
-                eye.buffer.set_active(active)
-                eye.active = active
+            want = active and eye.source is None
+            if eye.buffer is not None and eye.active != want:
+                eye.buffer.set_active(want)
+                eye.active = want
 
     # --------------------------------------------------- GL-side (callback)
 
@@ -705,6 +981,12 @@ class VRManager(DirectObject):
                 self._session_requested = False
                 self._create_session()
                 return
+            if self._env_create_pending and self.rt is not None and self.rt.session is not None:
+                self._env_create_pending = False
+                if self.rt.has("environment_depth"):
+                    self._create_environment_depth()
+                else:
+                    log.warning("This runtime has no XR_META_environment_depth")
             if self._pending_quads and self.rt is not None and self.rt.session is not None:
                 for q in self._pending_quads:
                     if q in self._quad_layers:
@@ -726,36 +1008,22 @@ class VRManager(DirectObject):
         _gl.ensure_current(self._hdc, self._hglrc)
         self._apply_floor_offset(rt.space_type)
 
-        # Swapchains sized/formatted to match Panda's eye textures exactly so the
-        # per-frame transfer is a single raw GPU copy.
+        # Colour swapchains are sized to the eye textures; how each frame gets
+        # into them (a raw copy when the formats allow, else a blit) and the
+        # depth swapchains are settled per source in `_prepare_eye_transfer`,
+        # since an external renderer can swap the source at any time.
         n = len(rt.view_configs)
         self._proj_views = (xr.CompositionLayerProjectionView * n)(
             *[xr.CompositionLayerProjectionView() for _ in range(n)])
-        self._depth_infos = []
+        self._depth_infos = [xr.CompositionLayerDepthInfoKHR(min_depth=0.0, max_depth=1.0)
+                             for _ in range(n)]
         w, h = self.stats["eye_size"]
-        depth_ok = self.submit_depth and rt.has("depth")
+        fmt = rt.pick_color_format(_gl.COLOR_FORMAT_PREFERENCE)
         for i, eye in enumerate(self._eyes):
-            src = self._native_id(eye.color_tex)
-            src_fmt = _gl.texture_internal_format(src)
-            fmt = rt.pick_color_format(_gl.COLOR_FORMAT_PREFERENCE)
             eye.swapchain = rt.create_swapchain(fmt, w, h)
-            eye.copier = _gl.TextureCopier(src_fmt, fmt)
             eye.swapchain.sub_image(self._proj_views[i].sub_image)
-            if depth_ok and eye.depth_tex is not None:
-                dfmt = _gl.texture_internal_format(self._native_id(eye.depth_tex))
-                if dfmt in rt.swapchain_formats:
-                    eye.depth_swapchain = rt.create_swapchain(dfmt, w, h, depth=True)
-                    eye.depth_copier = _gl.TextureCopier(dfmt, dfmt, depth=True)
-                    info = xr.CompositionLayerDepthInfoKHR(
-                        min_depth=0.0, max_depth=1.0, near_z=self.near, far_z=self.far)
-                    eye.depth_swapchain.sub_image(info.sub_image)
-                    self._depth_infos.append(info)
-                    self._proj_views[i].next = cast(pointer(info), c_void_p)
-                else:
-                    log.info("Depth format 0x%04X not accepted by the runtime; depth submission off", dfmt)
-                    depth_ok = False
-            log.info("Eye %d: swapchain %dx%d format 0x%04X (%s from 0x%04X)", i, w, h, fmt,
-                     eye.copier.mode, src_fmt)
+            eye.copier = eye.copier_src = eye.depth_src = None
+            eye.depth_swapchain = eye.depth_copier = None
         self._proj_layer = xr.CompositionLayerProjection(space=rt.space, views=self._proj_views)
         self._proj_ptr = rt.layer_pointer(self._proj_layer)
         self._head_loc = xr.SpaceLocation()
@@ -777,8 +1045,14 @@ class VRManager(DirectObject):
                 self.passthrough = Passthrough(rt, self.want_passthrough)
                 self.passthrough.create()
             except Exception as e:
-                log.info("Passthrough unavailable: %s", e)
+                log.warning("Passthrough unavailable (%s). Over Link, enable \"Passthrough over "
+                            "Meta Quest Link\" in the Link app; environment depth needs it too.", e)
                 self.passthrough = None
+        # Environment depth and the room model are *not* started here: over
+        # Link, starting depth sensing before frames flow (or without the
+        # passthrough feed running) wedges the runtime. See _start_mr_features.
+        if self.scene is not None and rt.has("scene"):
+            self.scene.attach(rt)
 
         # Quad swapchains are made on the next callback, after the session exists.
         self._pending_quads = list(self._quad_layers)
@@ -794,24 +1068,72 @@ class VRManager(DirectObject):
         self.status = "session"
         self._deferred.append(("vr-session-created", [self]))
 
+    def _prepare_eye_transfer(self, i, eye):
+        """(Re)build the copier and depth swapchain when an eye's source changes.
+        Returns False while the source has no GPU storage yet."""
+        rt = self.rt
+        src = eye.source if eye.source is not None else eye.color_tex
+        if eye.copier is None or eye.copier_src is not src:
+            fmt = _gl.texture_internal_format(self._native_id(src))
+            if not fmt:
+                return False
+            if eye.copier is not None:
+                eye.copier.destroy()
+            eye.copier = _gl.TextureCopier(fmt, eye.swapchain.format)
+            eye.copier_src = src
+            log.info("Eye %d: %s 0x%04X -> swapchain 0x%04X %dx%d", i, eye.copier.mode, fmt,
+                     eye.swapchain.format, eye.swapchain.width, eye.swapchain.height)
+
+        dsrc = eye.source_depth if eye.source is not None else eye.depth_tex
+        if not (self.submit_depth and rt.has("depth")):
+            dsrc = None
+        if dsrc is not eye.depth_src:
+            eye.depth_src = dsrc
+            if eye.depth_swapchain is not None:
+                eye.depth_swapchain.destroy()
+            eye.depth_swapchain = eye.depth_copier = None
+            self._proj_views[i].next = None
+            if dsrc is not None:
+                dfmt = _gl.texture_internal_format(self._native_id(dsrc))
+                if dfmt and dfmt in rt.swapchain_formats:
+                    sc = eye.swapchain
+                    eye.depth_swapchain = rt.create_swapchain(dfmt, sc.width, sc.height, depth=True)
+                    eye.depth_copier = _gl.TextureCopier(dfmt, dfmt, depth=True)
+                    info = self._depth_infos[i]
+                    eye.depth_swapchain.sub_image(info.sub_image)
+                    self._proj_views[i].next = cast(pointer(info), c_void_p)
+                elif dfmt:
+                    log.info("Eye %d: depth format 0x%04X not accepted by the runtime; "
+                             "no depth for reprojection", i, dfmt)
+                else:
+                    eye.depth_src = None  # not allocated yet; try again next frame
+        return True
+
     def _submit_frame(self):
         rt = self.rt
         fs = rt.frame_state
         layers = []
-        if self._render_frame:
+        render = self._render_frame
+        if render:
+            for i, eye in enumerate(self._eyes):
+                render = self._prepare_eye_transfer(i, eye) and render
+        if render:
             native = self._native_id
             views = rt.views
             pviews = self._proj_views
             for i, eye in enumerate(self._eyes):
                 sc = eye.swapchain
                 dst = sc.acquire()
-                eye.copier.copy(native(eye.color_tex), dst, sc.width, sc.height)
+                eye.copier.copy(native(eye.copier_src), dst, sc.width, sc.height)
                 sc.release()
                 if eye.depth_swapchain is not None:
                     dsc = eye.depth_swapchain
                     ddst = dsc.acquire()
-                    eye.depth_copier.copy(native(eye.depth_tex), ddst, dsc.width, dsc.height)
+                    eye.depth_copier.copy(native(eye.depth_src), ddst, dsc.width, dsc.height)
                     dsc.release()
+                    info = self._depth_infos[i]
+                    info.near_z = self.near
+                    info.far_z = self.far
                 pviews[i].pose = views[i].pose
                 pviews[i].fov = views[i].fov
             layer = self._proj_layer
@@ -857,6 +1179,13 @@ class VRManager(DirectObject):
         if self.passthrough is not None:
             self.passthrough.destroy()
             self.passthrough = None
+        self._guard = None
+        self._env_create_pending = False
+        if self.environment_depth is not None:
+            self.environment_depth.destroy()
+            self._deferred.append((self.environment_depth.detach_occluders, []))
+        if self.scene is not None:
+            self.scene.destroy()
         for q in self._quad_layers:
             q._destroy_xr()
         for eye in self._eyes:
@@ -870,6 +1199,7 @@ class VRManager(DirectObject):
                 if c is not None and gl:
                     c.destroy()
                 setattr(eye, attr, None)
+            eye.copier_src = eye.depth_src = None
             if eye.mask is not None:
                 eye.mask.remove_node()
                 eye.mask = None
@@ -901,9 +1231,10 @@ class VRManager(DirectObject):
             if eye.buffer is not None:
                 engine.remove_window(eye.buffer)
                 eye.buffer = None
-        if self._submit_buffer is not None:
-            engine.remove_window(self._submit_buffer)
-            self._submit_buffer = None
+        for attr in ("_submit_buffer", "_prepare_buffer"):
+            if getattr(self, attr) is not None:
+                engine.remove_window(getattr(self, attr))
+                setattr(self, attr, None)
         self.set_stats_visible(False)
         for card in self._mirror_cards:
             card.remove_node()
@@ -962,6 +1293,7 @@ class VRManager(DirectObject):
         self._set_clock(None)
         try:
             t0 = time.perf_counter()
+            self._watch_stalls(t0)
             fs = rt.wait_and_begin_frame()
             wait_ms = (time.perf_counter() - t0) * 1000.0
             t = fs.predicted_display_time
@@ -1009,6 +1341,20 @@ class VRManager(DirectObject):
             self._teardown = "instance"
             return task.cont
 
+        self._focused_frames = self._focused_frames + 1 if rt.focused else 0
+        if self._focused_frames >= self.MR_SETTLE_FRAMES:
+            self._start_mr_features(time.perf_counter())
+
+        env = self.environment_depth
+        if env is not None and env.provider is not None:
+            try:
+                env.acquire(t, scale)
+                env.update_occluders()
+            except XrCallError as e:
+                self._disable_mr_feature("environment_depth", str(e))
+        if self.scene is not None and self.scene.anchors:
+            self.scene.update(t, scale, time.perf_counter())
+
         if self._mask_dirty:
             self._build_visibility_masks()
         self._sync_clear_color()
@@ -1053,9 +1399,7 @@ class VRManager(DirectObject):
             v = verts.astype("float32")
             pos = [(x * d, d, y * d) for x, y in v]
             node = make_geom_node("vr-hidden-area-%d" % eye.index, pos, idx.reshape(-1, 3))
-            mask = eye.cam.attach_new_node(node)
-            mask.hide(EYE_MASKS[1 - eye.index])
-            mask.set_bin(_MASK_BIN, 0)
+            mask = eye.mask_root.attach_new_node(node)
             mask.set_depth_write(True)
             mask.set_depth_test(False)
             mask.set_two_sided(True)

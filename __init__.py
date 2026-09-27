@@ -13,7 +13,7 @@ Panda3D-VR: OpenXR for Panda3D.
 Or attach to an existing ShowBase with ``VRManager(base)``.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 from .controller import HANDS, Controller
 from .core import EYE_MASKS, XR_AVAILABLE, BaseVrApp, VRManager

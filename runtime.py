@@ -33,6 +33,18 @@ FEATURE_EXTENSIONS = {
     "user_presence": "XR_EXT_user_presence",
     "passthrough": "XR_FB_passthrough",
     "debug": "XR_EXT_debug_utils",
+    "environment_depth": "XR_META_environment_depth",
+    "scene": "XR_FB_scene",
+    "scene_capture": "XR_FB_scene_capture",
+    "spatial_entity": "XR_FB_spatial_entity",
+    "spatial_query": "XR_FB_spatial_entity_query",
+    "spatial_storage": "XR_FB_spatial_entity_storage",
+    "scene_mesh": "XR_META_spatial_entity_mesh",
+}
+
+# Features that only work together; requesting one pulls in the rest.
+FEATURE_GROUPS = {
+    "scene": ("scene", "scene_capture", "spatial_entity", "spatial_query", "spatial_storage", "scene_mesh"),
 }
 
 _SPACE_TYPES = {
@@ -220,9 +232,12 @@ class XrRuntime:
         if xr.KHR_OPENGL_ENABLE_EXTENSION_NAME not in available:
             raise RuntimeError("The active OpenXR runtime does not support OpenGL")
         wanted = [xr.KHR_OPENGL_ENABLE_EXTENSION_NAME]
-        for feature in sorted(self.requested_features):
+        features = set(self.requested_features)
+        for f in list(features):
+            features.update(FEATURE_GROUPS.get(f, ()))
+        for feature in sorted(features):
             ext = FEATURE_EXTENSIONS.get(feature)
-            if ext in available:
+            if ext in available and ext not in wanted:
                 wanted.append(ext)
         for ext in self.extra_extensions:
             if ext in available and ext not in wanted:
@@ -434,6 +449,14 @@ class XrRuntime:
                 ev = cast(byref(buf), POINTER(xr.EventDataPerfSettingsEXT)).contents
                 emit("performance-notification", domain=ev.domain, sub_domain=ev.sub_domain,
                      level=ev.to_level)
+            elif t == ST.EVENT_DATA_SPACE_QUERY_RESULTS_AVAILABLE_FB.value:
+                ev = cast(byref(buf), POINTER(xr.EventDataSpaceQueryResultsAvailableFB)).contents
+                emit("space-query-results", request_id=ev.request_id)
+            elif t == ST.EVENT_DATA_SPACE_QUERY_COMPLETE_FB.value:
+                ev = cast(byref(buf), POINTER(xr.EventDataSpaceQueryCompleteFB)).contents
+                emit("space-query-complete", request_id=ev.request_id, result=ev.result)
+            elif t == ST.EVENT_DATA_SCENE_CAPTURE_COMPLETE_FB.value:
+                emit("scene-capture-complete")
             elif t == ST.EVENT_DATA_EVENTS_LOST.value:
                 log.warning("OpenXR event queue overflowed; some events were lost")
 

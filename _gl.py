@@ -93,13 +93,19 @@ def gl_version():
         return "unknown"
 
 
-def texture_internal_format(tex_id):
-    """Query a 2D texture's internal format without disturbing Panda's bindings."""
-    prev = int(GL.glGetIntegerv(GL.GL_TEXTURE_BINDING_2D))
-    GL.glBindTexture(GL.GL_TEXTURE_2D, tex_id)
-    fmt = int(GL.glGetTexLevelParameteriv(GL.GL_TEXTURE_2D, 0, GL.GL_TEXTURE_INTERNAL_FORMAT))
-    GL.glBindTexture(GL.GL_TEXTURE_2D, prev)
-    return fmt
+_BINDINGS = {GL.GL_TEXTURE_2D: GL.GL_TEXTURE_BINDING_2D, GL.GL_TEXTURE_2D_ARRAY: GL.GL_TEXTURE_BINDING_2D_ARRAY}
+
+
+def texture_internal_format(tex_id, target=GL.GL_TEXTURE_2D):
+    """Query a texture's internal format without disturbing Panda's bindings.
+
+    Returns 0 when the texture has no storage yet."""
+    prev = int(GL.glGetIntegerv(_BINDINGS[target]))
+    GL.glBindTexture(target, tex_id)
+    width = int(GL.glGetTexLevelParameteriv(target, 0, GL.GL_TEXTURE_WIDTH))
+    fmt = int(GL.glGetTexLevelParameteriv(target, 0, GL.GL_TEXTURE_INTERNAL_FORMAT))
+    GL.glBindTexture(target, prev)
+    return fmt if width else 0
 
 
 def clear_errors():

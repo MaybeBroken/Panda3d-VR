@@ -257,11 +257,9 @@ def test_visibility_mask_geometry(base, make_vr):
     verts = np.array([[-1, -1], [1, -1], [-1, -0.8]], np.float32)
     vr.rt.visibility_mask = lambda i: (verts, np.array([0, 1, 2], np.uint32))
     _run(base)
-    for i, eye in enumerate(vr._eyes):
+    for eye in vr._eyes:
         assert eye.mask is not None
-        assert eye.mask.is_hidden(core.EYE_MASKS[1 - i])
-        assert not eye.mask.is_hidden(core.EYE_MASKS[i])
-    assert vr._eyes[0].mask.get_bin_name() == core._MASK_BIN
+        assert eye.mask.get_top() == eye.mask_root, "mask is outside the shared scene graph"
 
 
 def test_quad_layer_submitted(base, make_vr):
@@ -282,3 +280,302 @@ def test_quad_layer_created_after_session(base, make_vr):
     _run(base, 5)
     assert created and created[0].swapchain is not None
     assert vr.rt.ended[-1] == 2
+
+
+def test_hidden_area_mesh_only_in_its_own_eye(base, make_vr):
+    """Regression: each eye's hidden-area mesh leaked into the other eye's view.
+
+    The mesh sits just past the near plane of its own eye, so seen from the
+    other eye (an IPD away) it covered the inner top/bottom corners -- the
+    artifact reported next to the nose."""
+    vr = make_vr([_gl.GL_RGBA8], features={"visibility_mask"}, msaa=0, submit_depth=False)
+    # Left eye: a mask covering its whole frustum.  Right eye: no mask.
+    full = np.array([[-3, -3], [3, -3], [3, 3], [-3, 3]], np.float32)
+    quad = np.array([0, 1, 2, 0, 2, 3], np.uint32)
+    vr.rt.visibility_mask = lambda i: (full, quad) if i == 0 else (np.zeros((0, 2), np.float32), np.zeros(0, np.uint32))
+    # Put the other eye's mask where it would be visible: a wide IPD.
+    vr.rt.views[0].pose.position.x = -0.03
+    vr.rt.views[1].pose.position.x = 0.03
+    _run(base, 5)
+    left, right = vr.rt.swapchains[0].pixels, vr.rt.swapchains[1].pixels
+    assert np.allclose(left[..., :3], 0, atol=0.02), "left eye fully masked"
+    leaked = ~np.isclose(right[..., :3], (1, 0, 0), atol=0.02).all(axis=-1)
+    assert not leaked.any(), "right eye sees the left mask in %d pixels" % leaked.sum()
+
+
+# ---------------------------------------------------------- environment depth
+
+ENV_W, ENV_H, ENV_NEAR, WALL = 32, 32, 0.1, 1.0
+
+
+def _fake_env(vr):
+    """Stand-in for XR_META_environment_depth: a real GL D16 texture array
+    holding a flat wall WALL metres in front of each eye."""
+    env = vr.environment_depth
+
+    def create(rt, keepalive_root):
+        env.rt = rt
+        env.provider = object()
+        env.width, env.height = ENV_W, ENV_H
+        env._keepalive_root = keepalive_root
+        env._format = None
+        d = 1.0 - ENV_NEAR / WALL  # infinite-far GL depth of the wall
+        data = np.full((2, ENV_H, ENV_W), int(d * 65535), np.uint16)
+        prev = int(GL.glGetIntegerv(GL.GL_TEXTURE_BINDING_2D_ARRAY))
+        tex = int(GL.glGenTextures(1))
+        GL.glBindTexture(GL.GL_TEXTURE_2D_ARRAY, tex)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D_ARRAY, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)  # complete
+        GL.glTexImage3D(GL.GL_TEXTURE_2D_ARRAY, 0, _gl.GL_DEPTH_COMPONENT16, ENV_W, ENV_H, 2, 0,
+                        GL.GL_DEPTH_COMPONENT, GL.GL_UNSIGNED_SHORT, data)
+        GL.glBindTexture(GL.GL_TEXTURE_2D_ARRAY, prev)
+        env._images = [tex]
+
+    def acquire(time, scale):
+        env.near, env.far = ENV_NEAR, float("inf")
+        env.params = core_env.depth_params(env.near, env.far)
+        for i in range(2):
+            core.apply_pose(env.views[i], vr.rt.views[i].pose, scale)
+            f = vr.rt.views[i].fov
+            import math
+            env.fov[i] = tuple(math.tan(a) for a in (f.angle_left, f.angle_right, f.angle_down, f.angle_up))
+        env._pending = 0
+        if env._storage_ready:
+            env.valid = True
+            env.frame += 1
+
+    def destroy():
+        env.provider = None
+        env.valid = False
+
+    class FakePassthrough:
+        handle = ptr = None
+        feed_running = False
+
+        def start_feed(self):
+            self.feed_running = True
+
+        def destroy(self):
+            pass
+
+    env.create = create
+    env.acquire = acquire
+    env.destroy = destroy
+    vr.rt.focused = True
+    vr.passthrough = FakePassthrough()
+    return env
+
+
+SETTLE = 50  # frames: MR features wait for a focused, stable session
+
+
+import panda3d_vr.environment as core_env  # noqa: E402
+
+
+def test_environment_depth_copy_and_readback(base, make_vr):
+    vr = make_vr([_gl.GL_RGBA8], features={"environment_depth"}, msaa=0, submit_depth=False,
+                 environment_depth=True)
+    _fake_env(vr)
+    _run(base, SETTLE + 6)
+    env = vr.environment_depth
+    assert env.valid and env.texture is not None
+    metres = env.read_depth()
+    assert metres.shape == (2, ENV_H, ENV_W)
+    assert np.allclose(metres, WALL, atol=0.01), "linearised depth matches the wall"
+    p = env.world_point(0, 0.5, 0.5, WALL)
+    eye = vr.eye_cameras[0].get_pos(base.render)
+    assert abs((p - eye).length() - WALL) < 0.05
+
+
+@pytest.mark.parametrize("distance, occluded", [(3.0, True), (0.5, False)])
+def test_environment_occlusion(base, make_vr, distance, occluded):
+    vr = make_vr([_gl.GL_RGBA8], features={"environment_depth"}, msaa=0, submit_depth=False,
+                 environment_depth="occlusion")
+    _fake_env(vr)
+    cm = CardMaker("virtual")
+    cm.set_frame(-5, 5, -5, 5)
+    card = base.render.attach_new_node(cm.generate())
+    card.set_color(0, 1, 0, 1)
+    card.set_pos(0, distance, 1.6)  # a green virtual wall at `distance`
+    try:
+        _run(base, SETTLE + 8)
+    finally:
+        card.remove_node()
+    px = vr.rt.swapchains[0].pixels[H // 2, W // 2, :3]
+    if occluded:
+        assert np.allclose(px, (1, 0, 0), atol=0.02), "real wall at 1 m hides the virtual one at 3 m"
+    else:
+        assert np.allclose(px, (0, 1, 0), atol=0.02), "virtual object in front of the real wall stays"
+
+
+# ------------------------------------------------------------ external sources
+
+def _external_eye(base, vr, i, color=(0, 1, 0, 1), float_color=False, depth=True):
+    """A stand-in external renderer: its own buffer, drawing through the VR eye camera."""
+    from panda3d.core import FrameBufferProperties, GraphicsOutput, GraphicsPipe, Texture, WindowProperties
+
+    fb = FrameBufferProperties()
+    if float_color:
+        fb.set_float_color(True)
+        fb.set_rgba_bits(16, 16, 16, 16)
+    else:
+        fb.set_rgba_bits(8, 8, 8, 8)
+    fb.set_depth_bits(32)
+    fb.set_float_depth(True)
+    w, h = vr.eye_size
+    buf = base.graphicsEngine.make_output(base.pipe, "external-%d" % i, -60, fb, WindowProperties.size(w, h),
+                                          GraphicsPipe.BF_refuse_window, base.win.get_gsg(), base.win)
+    tex, dtex = Texture("ext-color-%d" % i), Texture("ext-depth-%d" % i)
+    buf.add_render_texture(tex, GraphicsOutput.RTM_bind_or_copy, GraphicsOutput.RTP_color)
+    buf.add_render_texture(dtex, GraphicsOutput.RTM_bind_or_copy, GraphicsOutput.RTP_depth)
+    buf.set_clear_color_active(True)
+    buf.set_clear_color(color)
+    buf.make_display_region().set_camera(vr.eye_cameras[i])
+    vr.set_eye_source(i, tex, dtex if depth else None)
+    return buf
+
+
+def test_external_eye_sources(base, make_vr):
+    formats = [_gl.GL_SRGB8_ALPHA8, _gl.GL_DEPTH_COMPONENT32F]
+    vr = make_vr(formats, features={"depth"}, msaa=0, submit_depth=True)
+    assert vr.eyes_ready and vr.eye_size == (W, H)
+    bufs = [_external_eye(base, vr, 0, (0, 1, 0, 1)), _external_eye(base, vr, 1, (0, 0, 1, 1), float_color=True)]
+    try:
+        _run(base, 6)
+        color = [sc for sc in vr.rt.swapchains if not sc.depth]
+        assert np.allclose(color[0].pixels[H // 2, W // 2, :3], (0, 1, 0), atol=0.02)
+        assert np.allclose(color[1].pixels[H // 2, W // 2, :3], (0, 0, 1), atol=0.02)
+        assert vr._eyes[0].copier.mode == "copy" and vr._eyes[1].copier.mode == "blit"
+        assert not vr._eyes[0].buffer.is_active(), "built-in eye rendering is idle"
+        assert len([sc for sc in vr.rt.swapchains if sc.depth]) == 2, "external depth submitted"
+
+        vr.clear_eye_sources()
+        _run(base, 4)
+        assert np.allclose(color[0].pixels[H // 2, W // 2, :3], (1, 0, 0), atol=0.02), "back to built-in"
+    finally:
+        for b in bufs:
+            base.graphicsEngine.remove_window(b)
+
+
+# ------------------------------------------------------- mcshader integration
+
+def test_mcshader_stereo(base, make_vr):
+    """A Minecraft shaderpack rendered per eye and submitted to the headset.
+
+    Needs mcshader and a pack: set MCSHADER_PACK to a pack .zip/directory."""
+    import os
+    pack = os.environ.get("MCSHADER_PACK")
+    mcshader = pytest.importorskip("mcshader")
+    if not pack or not os.path.exists(pack):
+        pytest.skip("set MCSHADER_PACK to run")
+    from direct.showbase.MessengerGlobal import messenger  # noqa: F401
+
+    vr = make_vr([_gl.GL_SRGB8_ALPHA8, _gl.GL_DEPTH_COMPONENT32F], features={"depth"},
+                 msaa=0, submit_depth=True)
+    app = mcshader.init(base, pack=pack, profile="LOW", sky=True, vr=vr)
+    try:
+        assert app.vr.active, "bridge switched the pipeline to the eyes"
+        assert [v.name for v in app.pipe.views] == ["vr-eye0", "vr-eye1"]
+        ground = app.load("models/environment", type="terrain", scale=0.25, pos=(-8, 42, 0))
+        _run(base, 12)
+        color = [sc for sc in vr.rt.swapchains if not sc.depth]
+        depth = [sc for sc in vr.rt.swapchains if sc.depth]
+        left, right = color[0].pixels[..., :3], color[1].pixels[..., :3]
+        for img in (left, right):
+            assert not np.allclose(img, (1, 0, 0), atol=0.05), "shaded image, not the clear colour"
+            assert img.std() > 0.01, "a real scene, not a flat fill"
+        assert np.abs(left - right).mean() > 1e-3, "each eye rendered from its own camera"
+        assert len(depth) == 2 and (depth[0].pixels < 1.0).any(), "scene depth submitted"
+        assert not vr._eyes[0].buffer.is_active()
+    finally:
+        app.vr.detach()
+        base.taskMgr.remove("mcshader-pipeline-uniforms")
+        app.pipe._teardown()
+        if app.sky is not None:
+            app.sky.remove_node()
+        for np_ in base.render.find_all_matches("**/+ModelRoot"):
+            np_.remove_node()
+
+
+def test_environment_depth_waits_for_a_settled_session(base, make_vr):
+    vr = make_vr([_gl.GL_RGBA8], features={"environment_depth"}, msaa=0, submit_depth=False,
+                 environment_depth=True)
+    env = _fake_env(vr)
+    _run(base, 10)
+    assert env.provider is None, "not started while the session is settling"
+    _run(base, SETTLE)
+    assert env.provider is not None and vr.passthrough.feed_running, "started with the camera feed"
+
+
+def test_environment_depth_needs_passthrough(base, make_vr):
+    vr = make_vr([_gl.GL_RGBA8], features={"environment_depth"}, msaa=0, submit_depth=False,
+                 environment_depth=True)
+    env = _fake_env(vr)
+    vr.passthrough = None
+    disabled = []
+    base.accept("vr-feature-disabled", lambda name, why: disabled.append(name))
+    _run(base, SETTLE + 5)
+    base.ignore("vr-feature-disabled")
+    assert env.provider is None and disabled == ["environment_depth"]
+
+
+def test_stall_watchdog_disables_environment_depth(base, make_vr):
+    import time
+    vr = make_vr([_gl.GL_RGBA8], features={"environment_depth"}, msaa=0, submit_depth=False,
+                 environment_depth=True)
+    env = _fake_env(vr)
+    vr.STALL_SECONDS = 0.05  # scaled down for the test
+    real_acquire = env.acquire
+
+    def stalling_acquire(t, scale):
+        real_acquire(t, scale)
+        time.sleep(0.08)  # the runtime choking on depth
+
+    env.acquire = stalling_acquire
+    _run(base, SETTLE + 8)
+    assert env.provider is None, "watchdog switched depth off"
+    assert "environment_depth" in vr._mr_failed and not vr.want_environment_depth
+    before = len(vr.rt.ended)
+    _run(base, 3)
+    assert len(vr.rt.ended) == before + 3, "the app keeps rendering"
+
+
+def test_depth_without_images_is_switched_off(base, make_vr):
+    """Over Link without passthrough the runtime starts depth but never
+    delivers an image, while costing frame time: stop it."""
+    vr = make_vr([_gl.GL_RGBA8], features={"environment_depth"}, msaa=0, submit_depth=False,
+                 environment_depth=True)
+    env = _fake_env(vr)
+    vr.DEPTH_DATA_TIMEOUT = 0.05
+    env.acquire = lambda t, scale: None  # provider running, no images ever
+    reasons = []
+    base.accept("vr-feature-disabled", lambda name, why: reasons.append(why))
+    import time
+    for _ in range(SETTLE + 20):
+        base.taskMgr.step()
+        time.sleep(0.005)
+    base.ignore("vr-feature-disabled")
+    assert env.provider is None and reasons and "no depth images" in reasons[0]
+
+
+def test_sustained_slowdown_switches_feature_off(base, make_vr):
+    import time
+    vr = make_vr([_gl.GL_RGBA8], features={"environment_depth"}, msaa=0, submit_depth=False,
+                 environment_depth=True)
+    env = _fake_env(vr)
+    real_acquire = env.acquire
+    started = []
+
+    def slow_acquire(t, scale):
+        real_acquire(t, scale)
+        started.append(1)
+        time.sleep(0.03)  # every frame now much slower, but never a single "stall"
+
+    env.acquire = slow_acquire
+    for _ in range(SETTLE):
+        base.taskMgr.step()
+        time.sleep(0.004)  # a steady baseline before depth starts
+    t0 = time.perf_counter()
+    while env.provider is not None or not started:
+        base.taskMgr.step()
+        assert time.perf_counter() - t0 < 10, "slowdown never detected"
+    assert "environment_depth" in vr._mr_failed
